@@ -1,7 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { DEFAULT_NATIVE_BASE_URL } from "./native.mjs";
 
 export const DEFAULT_PORT = 17842;
 export const DEFAULT_HOST = "127.0.0.1";
@@ -14,24 +13,17 @@ export function expandPath(value) {
 }
 
 export function appHome() {
-  return resolve(expandPath(process.env.CODEX_ANTIGRAVITY_HOME?.trim() || "~/.codex-bridge-antigravity"));
+  return resolve(
+    expandPath(
+      process.env.ANTIGRAVITY_BRIDGE_HOME?.trim() ||
+      process.env.CODEX_ANTIGRAVITY_HOME?.trim() ||
+      "~/.antigravity-bridge"
+    )
+  );
 }
 
 export function configPath() {
   return join(appHome(), "config.json");
-}
-
-export function catalogPath() {
-  return join(appHome(), "codex", "model-catalog.json");
-}
-
-export function integrationStatePath() {
-  return join(appHome(), "codex", "integration.json");
-}
-
-export function codexConfigPath() {
-  const configured = process.env.CODEX_HOME?.trim();
-  return join(resolve(expandPath(configured || "~/.codex")), "config.toml");
 }
 
 export function defaultConfig(overrides = {}) {
@@ -42,7 +34,6 @@ export function defaultConfig(overrides = {}) {
     cwd: process.cwd(),
     mode: DEFAULT_MODE,
     agyPath: process.env.AGY_PATH?.trim() || "agy",
-    nativeBaseUrl: process.env.CODEX_NATIVE_BASE_URL?.trim() || DEFAULT_NATIVE_BASE_URL,
     requestTimeoutSec: 600,
     models: [],
     ...overrides,
@@ -82,6 +73,7 @@ export function resolveAgyExecutable(value) {
     join(homedir(), ".local", "bin", "agy"),
     "/opt/homebrew/bin/agy",
     "/usr/local/bin/agy",
+    "/usr/bin/agy",
   ];
   return candidates.find(candidate => existsSync(candidate)) || requested;
 }

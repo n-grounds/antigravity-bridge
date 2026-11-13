@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { appHome } from "./config.mjs";
 
-export const SERVICE_LABEL = "io.github.codex-bridge-antigravity.daemon";
+export const SERVICE_LABEL = "io.github.antigravity-bridge.daemon";
 
 function launchAgentsDir() {
   return join(homedir(), "Library", "LaunchAgents");

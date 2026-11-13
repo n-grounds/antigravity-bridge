@@ -5,7 +5,7 @@ import { extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { appHome } from "./config.mjs";
 
-export const COMPACTION_PREFIX = "codex-bridge-antigravity:compaction:v1:";
+export const COMPACTION_PREFIX = "antigravity-bridge:compaction:v1:";
 
 export function encodeCompactionSummary(summary) {
   return `${COMPACTION_PREFIX}${Buffer.from(String(summary || ""), "utf8").toString("base64url")}`;
@@ -24,43 +24,11 @@ function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function isBridgeCompactionItem(value) {
-  return isObject(value)
-    && value.type === "compaction"
-    && typeof value.encrypted_content === "string"
-    && value.encrypted_content.startsWith(COMPACTION_PREFIX);
-}
-
-/**
- * Bridge-owned compaction envelopes are readable by routed models, but the official native
- * backend cannot decrypt them. Convert them to plain input text before a model switch crosses
- * from Antigravity back to a native GPT response.
- */
-export function scrubBridgeArtifactsForNative(payload) {
-  if (!isObject(payload) || !Array.isArray(payload.input)) return payload;
-  let changed = false;
-  const input = payload.input.flatMap(item => {
-    if (!isBridgeCompactionItem(item)) return [item];
-    const summary = decodeCompactionSummary(item.encrypted_content);
-    if (summary === null) throw new Error("Invalid Antigravity compaction checkpoint");
-    changed = true;
-    return [{
-      type: "message",
-      role: "user",
-      content: [{ type: "input_text", text: `Compaction summary:\n${summary}` }],
-    }];
-  });
-  if (!changed) return payload;
-  const clean = { ...payload, input };
-  delete clean.previous_response_id;
-  return clean;
-}
-
 export function imageCacheDir() {
   try {
     return join(appHome(), "cache", "images");
   } catch {
-    return join(homedir(), ".codex-bridge-antigravity", "cache", "images");
+    return join(homedir(), ".antigravity-bridge", "cache", "images");
   }
 }
 
@@ -168,13 +136,14 @@ export function formatImagePart(part) {
 }
 
 function formatToolPart(part) {
-  if (part.type === "custom_tool_call_output" || part.type === "function_call_output") {
+  if (part.type === "custom_tool_call_output" || part.type === "function_call_output" || part.type === "tool_call_output") {
     const output = typeof part.output === "string" ? part.output : contentText(part.output) || JSON.stringify(part.output || "");
-    return `Tool output (${part.name || part.call_id || "tool"}):\n${output}`;
+    return `Tool output (${part.name || part.call_id || part.tool_call_id || "tool"}):\n${output}`;
   }
-  if (part.type === "custom_tool_call" || part.type === "function_call") {
-    const args = typeof part.arguments === "string" ? part.arguments : (part.input !== undefined ? JSON.stringify(part.input) : "");
-    return `Tool call (${part.name || part.call_id || "tool"}):\n${args}`;
+  if (part.type === "custom_tool_call" || part.type === "function_call" || part.type === "tool_call") {
+    const args = typeof part.arguments === "string" ? part.arguments : (part.input !== undefined ? JSON.stringify(part.input) : (part.function?.arguments || ""));
+    const name = part.name || part.call_id || part.tool_call_id || part.function?.name || "tool";
+    return `Tool call (${name}):\n${args}`;
   }
   return JSON.stringify(part);
 }
@@ -188,10 +157,11 @@ function contentText(content) {
     if (typeof part.text === "string") return part.text;
     if (typeof part.input_text === "string") return part.input_text;
     if (typeof part.output_text === "string") return part.output_text;
+    if (part.type === "text") return part.text || "";
     if (part.type === "input_image" || part.type === "image" || part.type === "image_url") {
       return formatImagePart(part);
     }
-    if (part.type === "function_call" || part.type === "function_call_output" || part.type === "custom_tool_call" || part.type === "custom_tool_call_output") {
+    if (part.type === "function_call" || part.type === "function_call_output" || part.type === "custom_tool_call" || part.type === "custom_tool_call_output" || part.type === "tool_call" || part.type === "tool_call_output") {
       return formatToolPart(part);
     }
     return "";
@@ -202,11 +172,11 @@ function hasImagePart(value) {
   if (Array.isArray(value)) return value.some(hasImagePart);
   if (!value || typeof value !== "object") return false;
   if (["input_image", "image", "image_url"].includes(value.type)) return true;
-  return ["content", "input", "summary"].some(key => hasImagePart(value[key]));
+  return ["content", "input", "summary", "messages", "image_url"].some(key => hasImagePart(value[key]));
 }
 
 export function hasImageInput(payload) {
-  return hasImagePart(payload?.input);
+  return hasImagePart(payload?.input) || hasImagePart(payload?.messages) || hasImagePart(payload?.prompt);
 }
 
 function itemText(item) {
@@ -231,24 +201,85 @@ function itemText(item) {
 
 export function buildAgyPrompt(payload) {
   const sections = [];
-  const input = payload.input;
   const systemInstructions = [];
-  if (hasImagePart(input)) {
+
+  if (hasImageInput(payload)) {
     systemInstructions.push("MANDATORY IMAGE PREFLIGHT: this request includes visual attachment(s). Before answering the user's request, you MUST inspect every [Image attachment: ...] by calling the view_file tool with its exact path, and every [Image URL: ...] with the browser/image reading tool. Wait for those tool results before composing the answer. Do not say an image could not be read until you have performed the corresponding tool call.");
   }
-  if (payload.instructions) systemInstructions.push(itemText(payload.instructions));
-  if (systemInstructions.length) sections.push(`System instructions:\n${systemInstructions.join("\n\n")}`);
-  if (typeof input === "string") {
-    sections.push(`User:\n${input}`);
-  } else if (Array.isArray(input)) {
-    for (const item of input) {
-      const text = itemText(item);
-      if (!text) continue;
-      const role = item?.role || (item?.type === "message" ? "user" : "context");
-      sections.push(`${String(role).replace(/^./, char => char.toUpperCase())}:\n${text}`);
-    }
-  } else if (input !== undefined) {
-    sections.push(`User:\n${JSON.stringify(input)}`);
+  if (payload.instructions) {
+    systemInstructions.push(itemText(payload.instructions));
   }
+
+  // Handle OpenAI Chat messages format: { messages: [...] }
+  if (Array.isArray(payload.messages)) {
+    for (const msg of payload.messages) {
+      if (!msg || typeof msg !== "object") continue;
+      const role = String(msg.role || "user").toLowerCase();
+      const text = contentText(msg.content);
+
+      if (role === "system" || role === "developer") {
+        if (text) systemInstructions.push(text);
+        continue;
+      }
+
+      if (role === "tool" || role === "function") {
+        const toolId = msg.tool_call_id || msg.name || "tool";
+        sections.push(`Tool output (${toolId}):\n${text}`);
+        continue;
+      }
+
+      if (role === "assistant") {
+        const parts = [];
+        if (text) parts.push(text);
+        if (Array.isArray(msg.tool_calls)) {
+          for (const tc of msg.tool_calls) {
+            const fnName = tc.function?.name || tc.name || tc.id || "tool";
+            const fnArgs = tc.function?.arguments || tc.arguments || "";
+            parts.push(`Tool call (${fnName}):\n${fnArgs}`);
+          }
+        }
+        if (parts.length > 0) {
+          sections.push(`Assistant:\n${parts.join("\n")}`);
+        }
+        continue;
+      }
+
+      // Default role (user)
+      if (text) {
+        sections.push(`User:\n${text}`);
+      }
+    }
+  }
+
+  // Handle OpenAI Responses API input format: { input: [...] }
+  const input = payload.input;
+  if (input !== undefined) {
+    if (typeof input === "string") {
+      sections.push(`User:\n${input}`);
+    } else if (Array.isArray(input)) {
+      for (const item of input) {
+        const text = itemText(item);
+        if (!text) continue;
+        const role = item?.role || (item?.type === "message" ? "user" : "context");
+        sections.push(`${String(role).replace(/^./, char => char.toUpperCase())}:\n${text}`);
+      }
+    } else {
+      sections.push(`User:\n${JSON.stringify(input)}`);
+    }
+  }
+
+  // Handle text completion prompt: { prompt: "..." }
+  if (payload.prompt !== undefined && !payload.messages && !payload.input) {
+    if (typeof payload.prompt === "string") {
+      sections.push(payload.prompt);
+    } else if (Array.isArray(payload.prompt)) {
+      sections.push(payload.prompt.join("\n"));
+    }
+  }
+
+  if (systemInstructions.length) {
+    sections.unshift(`System instructions:\n${systemInstructions.join("\n\n")}`);
+  }
+
   return sections.join("\n\n").trim();
 }

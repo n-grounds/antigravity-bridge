@@ -1,6 +1,3 @@
-import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { spawn } from "node:child_process";
 
 export const MODEL_PREFIX = "antigravity/";
@@ -11,14 +8,13 @@ export function isAntigravityModel(value) {
   return typeof value === "string" && value.startsWith(MODEL_PREFIX);
 }
 
-export function isLegacyBridgeModel(value) {
-  return typeof value === "string" && (value.startsWith("freebuff/") || value.startsWith("gemini-web/"));
-}
-
 export const FALLBACK_AGY_MODELS = [
   ["gemini-3.8-flash-high", "Gemini 3.8 Flash (High)"],
   ["gemini-3.8-flash-medium", "Gemini 3.8 Flash (Medium)"],
   ["gemini-3.8-flash-low", "Gemini 3.8 Flash (Low)"],
+  ["claude-sonnet-4-6", "Claude Sonnet 4.6 (Thinking)"],
+  ["claude-opus-4-6-thinking", "Claude Opus 4.6 (Thinking)"],
+  ["gpt-oss-120b-medium", "GPT-OSS 120B (Medium)"],
 ].map(([id, displayName]) => ({ id, displayName }));
 
 function runAgyModels(agyPath, timeoutMs = 30_000) {
@@ -58,10 +54,22 @@ function runAgyModels(agyPath, timeoutMs = 30_000) {
 }
 
 export function parseAgyModels(text) {
+  // Strip ANSI escape codes
+  const clean = String(text).replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "");
   const models = [];
-  for (const line of String(text).split(/\r?\n/)) {
+  for (const line of clean.split(/\r?\n/)) {
     const trimmed = line.trim();
     if (!trimmed || /^model(s)?$/i.test(trimmed)) continue;
+    if (/fetching available models/i.test(trimmed)) {
+      const afterSpinner = trimmed.replace(/.*fetching available models\.\.\./i, "").trim();
+      if (afterSpinner) {
+        const match = afterSpinner.match(/^(\S+)\s+(.+?)\s*$/);
+        if (match && /^[A-Za-z0-9._-]+$/.test(match[1])) {
+          models.push({ id: match[1], displayName: match[2] });
+        }
+      }
+      continue;
+    }
     const match = trimmed.match(/^(\S+)\s+(.+?)\s*$/);
     if (!match || !/^[A-Za-z0-9._-]+$/.test(match[1])) continue;
     models.push({ id: match[1], displayName: match[2] });
@@ -78,23 +86,14 @@ function dedupeModels(models) {
   });
 }
 
-export function isAllowedAgyModel(modelOrId) {
-  const rawId = typeof modelOrId === "string" ? modelOrId : modelOrId?.id;
-  if (typeof rawId !== "string") return false;
-  const id = agyModelId(rawId);
-  const match = id.match(/^gemini-(\d+)(?:\.(\d+))?-flash(?:-(high|medium|low))?$/i);
-  if (!match) return false;
-  const major = parseInt(match[1], 10);
-  const minor = match[2] ? parseInt(match[2], 10) : 0;
-  if (major > 3) return true;
-  if (major === 3 && minor >= 8) return true;
-  return false;
-}
-
 export async function discoverAgyModels(agyPath) {
-  const parsed = parseAgyModels(await runAgyModels(agyPath));
-  const available = parsed.length > 0 ? parsed : FALLBACK_AGY_MODELS;
-  return available.filter(isAllowedAgyModel);
+  try {
+    const parsed = parseAgyModels(await runAgyModels(agyPath));
+    if (parsed.length > 0) return parsed;
+  } catch {
+    // If agy models command fails, fall back to default catalog
+  }
+  return FALLBACK_AGY_MODELS;
 }
 
 export function routeId(modelId) {
@@ -105,100 +104,36 @@ export function agyModelId(route) {
   return route.startsWith(MODEL_PREFIX) ? route.slice(MODEL_PREFIX.length) : route;
 }
 
-function effortForModel(id) {
-  if (/(?:^|-)low$/.test(id)) return "low";
-  if (/(?:^|-)medium$/.test(id)) return "medium";
-  return "high";
+export function formatOpenAIModel(modelOrId) {
+  const id = typeof modelOrId === "string" ? modelOrId : modelOrId?.id;
+  return {
+    id,
+    object: "model",
+    created: 1700000000,
+    owned_by: "antigravity",
+    permission: [],
+    root: id,
+    parent: null,
+  };
 }
 
-function nativeCatalog() {
-  const candidates = [
-    process.env.CODEX_MODEL_CATALOG?.trim(),
-    join(homedir(), ".codex", "opencodex-catalog.json"),
-    join(homedir(), ".codex", "models_cache.json"),
-    join(homedir(), ".codex-freebuff-web", "codex", "model-catalog.json"),
-  ].filter(Boolean);
-  for (const path of candidates) {
-    if (!existsSync(path)) continue;
-    try {
-      const value = JSON.parse(readFileSync(path, "utf8"));
-      if (value && Array.isArray(value.models)) return value;
-    } catch {
-      // A stale optional cache should not prevent the bridge from starting.
+export function formatOpenAIModelsList(models) {
+  const data = [];
+  const seen = new Set();
+  for (const m of models) {
+    const id = typeof m === "string" ? m : m.id;
+    if (!seen.has(id)) {
+      seen.add(id);
+      data.push(formatOpenAIModel(id));
+    }
+    const prefixed = routeId(id);
+    if (!seen.has(prefixed)) {
+      seen.add(prefixed);
+      data.push(formatOpenAIModel(prefixed));
     }
   }
-  return { models: [] };
-}
-
-function modelSlug(value) {
-  return value && typeof value === "object" && !Array.isArray(value) && typeof value.slug === "string"
-    ? value.slug
-    : undefined;
-}
-
-function nativeTemplate(catalog) {
-  return catalog.models.find(model => {
-    const slug = modelSlug(model);
-    return slug && !slug.startsWith(MODEL_PREFIX)
-      && !slug.startsWith("freebuff/")
-      && !slug.startsWith("gemini-web/")
-      && Array.isArray(model.supported_reasoning_levels);
-  });
-}
-
-function reasoningLevel(template, effort) {
-  const levels = Array.isArray(template?.supported_reasoning_levels)
-    ? template.supported_reasoning_levels
-    : [];
-  const source = levels.find(level => level?.effort === effort);
   return {
-    ...(source && typeof source === "object" ? structuredClone(source) : {}),
-    effort,
-    description: `Antigravity ${effort} effort`,
-  };
-}
-
-function buildModel(template, model) {
-  const effort = effortForModel(model.id);
-  const base = template && typeof template === "object" ? structuredClone(template) : {};
-  const result = {
-    ...base,
-    slug: routeId(model.id),
-    display_name: model.displayName,
-    description: `Official Antigravity CLI model: ${model.displayName}`,
-    visibility: "list",
-    supported_in_api: true,
-    input_modalities: ["text", "image"],
-    tool_mode: null,
-    multi_agent_version: "disabled",
-    upgrade: null,
-    default_reasoning_level: effort,
-    supported_reasoning_levels: [reasoningLevel(template, effort)],
-    context_window: AGY_CONTEXT_WINDOW,
-    max_context_window: AGY_CONTEXT_WINDOW,
-    effective_context_window_percent: 100,
-    auto_compact_token_limit: AGY_AUTO_COMPACT_TOKEN_LIMIT,
-    use_responses_lite: false,
-    additional_speed_tiers: [],
-    service_tiers: [],
-    default_service_tier: null,
-  };
-  delete result.comp_hash;
-  delete result.availability_nux;
-  return result;
-}
-
-export function buildCodexCatalog(models) {
-  const source = nativeCatalog();
-  const template = nativeTemplate(source);
-  const preserved = source.models.filter(model => {
-    const slug = modelSlug(model);
-    return slug && !slug.startsWith(MODEL_PREFIX)
-      && !slug.startsWith("freebuff/")
-      && !slug.startsWith("gemini-web/");
-  });
-  return {
-    ...structuredClone(source),
-    models: [...preserved, ...models.map(model => buildModel(template, model))],
+    object: "list",
+    data,
   };
 }

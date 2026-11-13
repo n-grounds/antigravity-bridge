@@ -6,13 +6,17 @@ import {
   AGY_AUTO_COMPACT_TOKEN_LIMIT,
   AGY_CONTEXT_WINDOW,
   agyModelId,
-  isAntigravityModel,
-  isLegacyBridgeModel,
+  formatOpenAIModel,
+  formatOpenAIModelsList,
   routeId,
 } from "./models.mjs";
-import { buildAgyPrompt, encodeCompactionSummary, hasImageInput, imageCacheDir, scrubBridgeArtifactsForNative } from "./prompt.mjs";
+import {
+  buildAgyPrompt,
+  encodeCompactionSummary,
+  hasImageInput,
+  imageCacheDir,
+} from "./prompt.mjs";
 import { AgyError, runAgyTurn } from "./agy.mjs";
-import { fetchNative, nativeWebSocketHeaders, nativeWebSocketUrl, pipeNativeResponse } from "./native.mjs";
 
 const MAX_ENCODED_BODY_BYTES = 64 * 1024 * 1024;
 const MAX_DECODED_BODY_BYTES = 128 * 1024 * 1024;
@@ -28,8 +32,15 @@ function json(res, status, value) {
   res.end(body);
 }
 
-function errorPayload(message, type = "invalid_request_error", code) {
-  return { error: { type, message, ...(code ? { code } : {}) } };
+function errorPayload(message, type = "invalid_request_error", code = null) {
+  return {
+    error: {
+      message,
+      type,
+      param: null,
+      ...(code ? { code } : {}),
+    },
+  };
 }
 
 async function readJson(req) {
@@ -60,6 +71,22 @@ async function readJson(req) {
   } catch {
     throw new AgyError("Request body must be valid JSON", "INVALID_JSON");
   }
+}
+
+function chatUsage(result) {
+  const input = result?.usage?.input_tokens ?? 0;
+  const output = result?.usage?.output_tokens ?? 0;
+  return {
+    prompt_tokens: input,
+    completion_tokens: output,
+    total_tokens: result?.usage?.total_tokens ?? (input + output),
+    ...(result?.usage?.cache_read_tokens !== undefined
+      ? { prompt_tokens_details: { cached_tokens: result.usage.cache_read_tokens } }
+      : {}),
+    ...(result?.usage?.thinking_tokens !== undefined
+      ? { completion_tokens_details: { reasoning_tokens: result.usage.thinking_tokens } }
+      : {}),
+  };
 }
 
 function usage(result) {
@@ -105,6 +132,12 @@ function sse(res, event, sequence, data) {
   return true;
 }
 
+function sseRaw(res, data) {
+  if (res.destroyed || res.writableEnded) return false;
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+  return true;
+}
+
 function responseEvent(event, sequence, data) {
   return { type: event, sequence_number: sequence.value++, ...data };
 }
@@ -115,17 +148,14 @@ function inputItems(input) {
   return Array.isArray(input) ? input : [input];
 }
 
-export function expandPreviousResponse(payload, responseStates, { native = false, conversations } = {}) {
+export function expandPreviousResponse(payload, responseStates, { conversations } = {}) {
   const previousId = typeof payload?.previous_response_id === "string"
     ? payload.previous_response_id
     : undefined;
   if (!previousId) return payload;
 
   const isPreviousAgy = conversations?.has(previousId);
-  // If target is native and previous was also native -> OpenAI upstream already has the session state
-  if (native && !isPreviousAgy) return payload;
-  // If target is antigravity and previous was also antigravity -> AGY CLI tracks session via conversationId
-  if (!native && isPreviousAgy) return payload;
+  if (isPreviousAgy) return payload;
 
   const state = responseStates.get(previousId);
   if (!state) return payload;
@@ -143,24 +173,6 @@ function rememberResponse(responseStates, payload, response) {
     items: [...inputItems(payload?.input), ...structuredClone(response.output)],
   });
   while (responseStates.size > 1_000) responseStates.delete(responseStates.keys().next().value);
-}
-
-function modelCatalogRows(models) {
-  return models.map(model => ({
-    slug: routeId(model.id),
-    display_name: model.displayName,
-    description: `Official Antigravity CLI model: ${model.displayName}`,
-    supported_in_api: true,
-    supported_reasoning_levels: [{ effort: effortFromId(model.id), description: "Antigravity model effort" }],
-    default_reasoning_level: effortFromId(model.id),
-    visibility: "list",
-    input_modalities: ["text", "image"],
-    context_window: AGY_CONTEXT_WINDOW,
-    max_context_window: AGY_CONTEXT_WINDOW,
-    effective_context_window_percent: 100,
-    auto_compact_token_limit: AGY_AUTO_COMPACT_TOKEN_LIMIT,
-    use_responses_lite: false,
-  }));
 }
 
 function effortFromId(id) {
@@ -216,24 +228,27 @@ async function runAgyPrompt({ config, selected, payload, prompt, mode, effort, c
   return result;
 }
 
-function resolveModel(payload, models) {
-  if (typeof payload.model !== "string" || !payload.model.trim()) throw new AgyError("model is required", "MODEL_REQUIRED");
+export function resolveModel(payload, models) {
+  if (typeof payload.model !== "string" || !payload.model.trim()) {
+    throw new AgyError("model is required", "MODEL_REQUIRED");
+  }
   const requested = payload.model.trim();
-  if (isLegacyBridgeModel(requested)) {
-    throw new AgyError(`Legacy bridge model is not supported: ${requested}`, "MODEL_PROVIDER");
-  }
-  if (!isAntigravityModel(requested)) return { kind: "native", route: requested, native: requested };
   const id = agyModelId(requested);
-  if (!models.some(model => model.id === id)) {
-    throw new AgyError(`Unknown Antigravity model: ${requested}`, "MODEL_NOT_FOUND");
+  if (models && models.length > 0) {
+    const match = models.find(m => m.id === id || m.id === requested);
+    if (!match && !models.some(m => routeId(m.id) === requested)) {
+      throw new AgyError(
+        `Unknown model: ${requested}. Available models: ${models.map(m => m.id).join(", ")}`,
+        "MODEL_NOT_FOUND"
+      );
+    }
   }
-  return { kind: "antigravity", route: routeId(id), agy: id };
+  return { route: id, agy: id };
 }
 
 async function runAgyResponse({ config, models, payload, conversations, responseStates, signal, emit }) {
   const effectivePayload = expandPreviousResponse(payload, responseStates, { conversations });
   const selected = resolveModel(effectivePayload, models);
-  if (selected.kind !== "antigravity") throw new AgyError("The request is not an Antigravity model", "MODEL_PROVIDER");
   const prompt = buildAgyPrompt(effectivePayload);
   if (!prompt) throw new AgyError("input is required", "INPUT_REQUIRED");
 
@@ -241,7 +256,7 @@ async function runAgyResponse({ config, models, payload, conversations, response
   const sequence = { value: 0 };
   const previous = typeof effectivePayload.previous_response_id === "string"
     ? conversations.get(effectivePayload.previous_response_id)
-    : undefined;
+    : (effectivePayload.conversation_id || undefined);
   const initial = responseBody({ id: responseId, model: selected.route, text: "", status: "in_progress" });
   const itemId = initial.output[0].id;
   emit("response.created", { response: initial }, sequence);
@@ -254,13 +269,14 @@ async function runAgyResponse({ config, models, payload, conversations, response
   }, sequence);
 
   let sentDelta = false;
+  const effort = effectivePayload.reasoning_effort || effectivePayload.reasoning?.effort || effectivePayload.effort;
   const result = await runAgyPrompt({
     config,
     selected,
     payload: effectivePayload,
     prompt,
-    mode: config.mode,
-    effort: effectivePayload.reasoning?.effort,
+    mode: effectivePayload.mode || config.mode,
+    effort,
     conversationId: previous,
     signal,
     onEvent: event => {
@@ -310,21 +326,21 @@ async function runAgyResponse({ config, models, payload, conversations, response
 async function runAgyCompaction({ config, models, payload, conversations, responseStates, signal }) {
   const effectivePayload = expandPreviousResponse(payload, responseStates, { conversations });
   const selected = resolveModel(effectivePayload, models);
-  if (selected.kind !== "antigravity") throw new AgyError("The request is not an Antigravity model", "MODEL_PROVIDER");
   const previous = typeof effectivePayload.previous_response_id === "string"
     ? conversations.get(effectivePayload.previous_response_id)
-    : undefined;
+    : (effectivePayload.conversation_id || undefined);
   const source = buildAgyPrompt(effectivePayload)
     || (previous ? "Use the preceding conversation in this AGY session as the source context." : "");
   if (!source) throw new AgyError("input is required for compaction", "INPUT_REQUIRED");
   const prompt = `${source}\n\nSummarize the preceding coding conversation for a later continuation. Preserve the user's goals, relevant decisions, file paths, commands, errors, and unfinished work. Be concise and do not invent facts.`;
+  const effort = effectivePayload.reasoning_effort || effectivePayload.reasoning?.effort || effectivePayload.effort;
   const result = await runAgyPrompt({
     config,
     selected,
     payload: effectivePayload,
     prompt,
     mode: "plan",
-    effort: effectivePayload.reasoning?.effort,
+    effort,
     conversationId: previous,
     signal,
   });
@@ -337,14 +353,14 @@ async function runAgyCompaction({ config, models, payload, conversations, respon
     encrypted_content: encodeCompactionSummary(summary),
   };
   const response = {
-      id: responseId,
-      object: "response",
-      created_at: Math.floor(Date.now() / 1000),
-      status: "completed",
-      model: selected.route,
-      output: [item],
-      output_text: "",
-      usage: usage(result),
+    id: responseId,
+    object: "response",
+    created_at: Math.floor(Date.now() / 1000),
+    status: "completed",
+    model: selected.route,
+    output: [item],
+    output_text: "",
+    usage: usage(result),
   };
   rememberResponse(responseStates, effectivePayload, response);
   return { response };
@@ -543,43 +559,6 @@ function websocketModel(payload) {
   return undefined;
 }
 
-function openNativeWebSocket(config, req, peer, onEvent, onClose) {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    let socket;
-    try {
-      socket = new WebSocket(nativeWebSocketUrl(config), { headers: nativeWebSocketHeaders(req) });
-    } catch (error) {
-      reject(error);
-      return;
-    }
-    socket.addEventListener("open", () => {
-      settled = true;
-      resolve(socket);
-    });
-    socket.addEventListener("message", async event => {
-      let value = event.data;
-      if (typeof value !== "string") {
-        if (value instanceof ArrayBuffer) value = Buffer.from(value).toString("utf8");
-        else if (ArrayBuffer.isView(value)) value = Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString("utf8");
-        else if (value && typeof value.text === "function") value = await value.text();
-      }
-      if (typeof value === "string") {
-        try { onEvent?.(JSON.parse(value)); } catch { /* preserve non-JSON upstream frames */ }
-        if (!peer.isClosed) peer.sendText(value);
-      }
-    });
-    socket.addEventListener("error", () => {
-      if (!settled) reject(new Error("Native Responses WebSocket connection failed"));
-      else onClose?.();
-    });
-    socket.addEventListener("close", event => {
-      if (!settled) reject(new Error(`Native Responses WebSocket closed before opening (${event.code})`));
-      else onClose?.(event);
-    });
-  });
-}
-
 function acceptWebSocket(config, models, conversations, responseStates, req, socket, head) {
   const url = new URL(req.url || "/", `http://${config.host}:${config.port}`);
   if (url.pathname !== "/v1/responses") {
@@ -599,24 +578,10 @@ function acceptWebSocket(config, models, conversations, responseStates, req, soc
     "\r\n",
   ].join("\r\n"));
 
-  let nativeSocket;
   let localAbort;
   let closed = false;
   let messages = Promise.resolve();
-  const nativePayloadQueue = [];
-  const nativePayloads = new Map();
-  const rememberNativeEvent = event => {
-    const responseId = event?.response?.id;
-    if (event?.type === "response.created" && typeof responseId === "string") {
-      nativePayloads.set(responseId, nativePayloadQueue.shift());
-      return;
-    }
-    if (event?.type === "response.completed" && event.response) {
-      const payload = typeof responseId === "string" ? nativePayloads.get(responseId) : undefined;
-      rememberResponse(responseStates, payload || nativePayloadQueue.shift(), event.response);
-      if (typeof responseId === "string") nativePayloads.delete(responseId);
-    }
-  };
+
   const peer = attachWebSocket(socket, text => {
     let payload;
     try { payload = JSON.parse(text); } catch {
@@ -625,42 +590,12 @@ function acceptWebSocket(config, models, conversations, responseStates, req, soc
     }
     if (payload?.type === "response.cancel") {
       localAbort?.abort();
-      if (nativeSocket?.readyState === WebSocket.OPEN) {
-        try { nativeSocket.send(text); } catch { /* upstream is closing */ }
-      }
       return;
     }
     messages = messages.then(async () => {
       const requestBody = websocketRequestBody(payload);
       const model = websocketModel(requestBody);
       try {
-        const selected = resolveModel(requestBody, models);
-        if (selected.kind === "native") {
-          const nativePayload = scrubBridgeArtifactsForNative(
-            expandPreviousResponse(requestBody, responseStates, { native: true, conversations }),
-          );
-          if (!nativeSocket || nativeSocket.readyState !== WebSocket.OPEN) {
-            let openedSocket;
-            openedSocket = await openNativeWebSocket(config, req, peer, rememberNativeEvent, () => {
-              if (nativeSocket === openedSocket) nativeSocket = undefined;
-            });
-            nativeSocket = openedSocket;
-          }
-          if (!peer.isClosed && nativeSocket.readyState === WebSocket.OPEN) {
-            nativePayloadQueue.push(nativePayload);
-            try {
-              const outbound = payload?.type === "response.create"
-                ? { ...nativePayload, type: "response.create" }
-                : nativePayload;
-              nativeSocket.send(JSON.stringify(outbound));
-            } catch (error) {
-              nativePayloadQueue.pop();
-              throw error;
-            }
-          }
-          return;
-        }
-
         const abort = new AbortController();
         localAbort = abort;
         const sequenceEmitter = (event, data, sequence) => {
@@ -710,9 +645,6 @@ function acceptWebSocket(config, models, conversations, responseStates, req, soc
     if (closed) return;
     closed = true;
     localAbort?.abort();
-    nativePayloadQueue.length = 0;
-    nativePayloads.clear();
-    if (nativeSocket && nativeSocket.readyState < WebSocket.CLOSING) nativeSocket.close();
   });
   peer.feed(head);
 }
@@ -731,151 +663,425 @@ function requestAbortSignal(req, res) {
   };
 }
 
-async function proxyNative(config, req, res, endpoint, body, responseStates) {
-  const request = requestAbortSignal(req, res);
-  try {
-    const upstream = await fetchNative({ config, req, endpoint, body, signal: request.signal });
-    if (endpoint === "responses" && body && typeof body === "object") {
-      const eventStream = (upstream.headers.get("content-type") || "").toLowerCase().includes("text/event-stream");
-      if (eventStream) {
-        await pipeNativeResponse(res, upstream, event => {
-          if (event?.type === "response.completed" && event.response) rememberResponse(responseStates, body, event.response);
-        });
-        return;
-      }
-      try {
-        const response = await upstream.clone().json();
-        rememberResponse(responseStates, body, response);
-      } catch {
-        // Let the original upstream body reach Codex; only continuation caching is optional.
-      }
-    }
-    await pipeNativeResponse(res, upstream);
-  } catch (error) {
-    if (request.signal.aborted) throw new AgyError("Request was cancelled", "ABORT_ERR");
-    if (error?.code === "NATIVE_AUTH") throw new AgyError(error.message, "NATIVE_AUTH");
-    throw new AgyError(
-      `Native Codex upstream failed: ${error instanceof Error ? error.message : String(error)}`,
-      "NATIVE_UPSTREAM",
-    );
-  } finally {
-    request.cleanup();
-  }
-}
-
-async function proxyNativeModels(config, req, res, models) {
-  const request = requestAbortSignal(req, res);
-  try {
-    const upstream = await fetchNative({ config, req, endpoint: "models", signal: request.signal });
-    if (!upstream.ok || !upstream.body) {
-      await pipeNativeResponse(res, upstream);
-      return;
-    }
-    let catalog;
-    try {
-      catalog = await upstream.json();
-    } catch (error) {
-      throw new AgyError(
-        `Native model catalog was not valid JSON: ${error instanceof Error ? error.message : String(error)}`,
-        "NATIVE_CATALOG",
-      );
-    }
-    if (!catalog || typeof catalog !== "object" || Array.isArray(catalog) || !Array.isArray(catalog.models)) {
-      throw new AgyError("Native model catalog did not contain a models array", "NATIVE_CATALOG");
-    }
-    const nativeModels = catalog.models.filter(model => {
-      const slug = model && typeof model === "object" && typeof model.slug === "string" ? model.slug : "";
-      return !isAntigravityModel(slug) && !isLegacyBridgeModel(slug);
-    });
-    json(res, upstream.status, { ...catalog, models: [...nativeModels, ...modelCatalogRows(models)] });
-  } catch (error) {
-    if (request.signal.aborted) throw new AgyError("Request was cancelled", "ABORT_ERR");
-    if (error instanceof AgyError) throw error;
-    if (error?.code === "NATIVE_AUTH") throw new AgyError(error.message, "NATIVE_AUTH");
-    throw new AgyError(
-      `Native model catalog request failed: ${error instanceof Error ? error.message : String(error)}`,
-      "NATIVE_UPSTREAM",
-    );
-  } finally {
-    request.cleanup();
-  }
-}
-
 export function createBridgeServer(config, models) {
   const conversations = new Map();
   const responseStates = new Map();
+
   const server = createServer(async (req, res) => {
+    // CORS Preflight
     if (req.method === "OPTIONS") {
       res.writeHead(204, {
         "access-control-allow-origin": "*",
         "access-control-allow-methods": "GET,POST,OPTIONS",
-        "access-control-allow-headers": "content-type,authorization",
+        "access-control-allow-headers": "content-type,authorization,x-conversation-id",
       });
       res.end();
       return;
     }
+
     const url = new URL(req.url || "/", `http://${config.host}:${config.port}`);
+
     try {
+      // Health Check
       if (req.method === "GET" && url.pathname === "/healthz") {
         json(res, 200, {
           ok: true,
-          service: "codex-bridge-antigravity",
+          service: "antigravity-bridge",
           agy_path: config.agyPath,
           cwd: config.cwd,
           model_count: models.length,
-          native_base_url: config.nativeBaseUrl,
-          websocket: true,
+          models: models.map(m => m.id),
         });
         return;
       }
-      if (req.method === "GET" && url.pathname === "/v1/models") {
-        await proxyNativeModels(config, req, res, models);
-        return;
-      }
-      if (req.method === "POST" && url.pathname === "/v1/alpha/search") {
-        const payload = await readJson(req);
-        await proxyNative(config, req, res, "alpha/search", payload, responseStates);
-        return;
-      }
-      if (req.method !== "POST" || !["/v1/responses", "/v1/responses/compact"].includes(url.pathname)) {
-        json(res, 404, errorPayload("Not found", "not_found"));
+
+      // GET /v1/models (List models)
+      if (req.method === "GET" && (url.pathname === "/v1/models" || url.pathname === "/v1/models/")) {
+        json(res, 200, formatOpenAIModelsList(models));
         return;
       }
 
-      const payload = await readJson(req);
-      const selected = resolveModel(payload, models);
-      if (selected.kind === "native") {
-        const nativePayload = scrubBridgeArtifactsForNative(
-          expandPreviousResponse(payload, responseStates, { native: true, conversations }),
-        );
-        await proxyNative(config, req, res, url.pathname.endsWith("/compact") ? "responses/compact" : "responses", nativePayload, responseStates);
+      // GET /v1/models/:model (Retrieve model)
+      if (req.method === "GET" && url.pathname.startsWith("/v1/models/")) {
+        const rawModelName = decodeURIComponent(url.pathname.slice("/v1/models/".length));
+        const id = agyModelId(rawModelName);
+        const match = models.find(m => m.id === id || m.id === rawModelName);
+        if (!match && !models.some(m => routeId(m.id) === rawModelName)) {
+          json(res, 404, errorPayload(`Model '${rawModelName}' not found`, "model_not_found"));
+          return;
+        }
+        json(res, 200, formatOpenAIModel(match ? match.id : rawModelName));
         return;
       }
-      if (url.pathname.endsWith("/compact")) {
+
+      // POST /v1/chat/completions (OpenAI Chat Completions API)
+      if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
+        const payload = await readJson(req);
+        const selected = resolveModel(payload, models);
+
+        if (!Array.isArray(payload.messages) || payload.messages.length === 0) {
+          throw new AgyError("messages array is required and must not be empty", "INVALID_MESSAGES");
+        }
+
+        const prompt = buildAgyPrompt(payload);
+        if (!prompt) {
+          throw new AgyError("Could not build a prompt from the provided messages", "INPUT_REQUIRED");
+        }
+
+        const chatId = `chatcmpl-${randomUUID().replaceAll("-", "")}`;
+        const createdTime = Math.floor(Date.now() / 1000);
+        const stream = payload.stream === true;
+        const effort = payload.reasoning_effort || payload.reasoning?.effort || payload.effort;
+        const mode = payload.mode || config.mode;
+        const conversationId = payload.conversation_id
+          || (typeof req.headers["x-conversation-id"] === "string" ? req.headers["x-conversation-id"] : undefined)
+          || (payload.previous_response_id && conversations.get(payload.previous_response_id))
+          || undefined;
+
         const request = requestAbortSignal(req, res);
+
         try {
-          const compacted = await runAgyCompaction({
+          if (stream) {
+            res.writeHead(200, {
+              "content-type": "text/event-stream; charset=utf-8",
+              "cache-control": "no-cache, no-transform",
+              connection: "keep-alive",
+              "access-control-allow-origin": "*",
+            });
+
+            // Initial chunk announcing role
+            sseRaw(res, {
+              id: chatId,
+              object: "chat.completion.chunk",
+              created: createdTime,
+              model: selected.route,
+              system_fingerprint: "fp_antigravity",
+              choices: [
+                {
+                  index: 0,
+                  delta: { role: "assistant", content: "" },
+                  logprobs: null,
+                  finish_reason: null,
+                },
+              ],
+            });
+
+            let sentDelta = false;
+            const result = await runAgyPrompt({
+              config,
+              selected,
+              payload,
+              prompt,
+              mode,
+              effort,
+              conversationId,
+              signal: request.signal,
+              onEvent: event => {
+                const delta = event.kind === "step" && typeof event.step.text_delta === "string"
+                  ? event.step.text_delta
+                  : "";
+                if (!delta) return;
+                sentDelta = true;
+                sseRaw(res, {
+                  id: chatId,
+                  object: "chat.completion.chunk",
+                  created: Math.floor(Date.now() / 1000),
+                  model: selected.route,
+                  system_fingerprint: "fp_antigravity",
+                  choices: [
+                    {
+                      index: 0,
+                      delta: { content: delta },
+                      logprobs: null,
+                      finish_reason: null,
+                    },
+                  ],
+                });
+              },
+            });
+
+            if (result.conversation_id) conversations.set(chatId, result.conversation_id);
+            const finalText = result.response || "";
+
+            if (!sentDelta && finalText) {
+              sseRaw(res, {
+                id: chatId,
+                object: "chat.completion.chunk",
+                created: Math.floor(Date.now() / 1000),
+                model: selected.route,
+                system_fingerprint: "fp_antigravity",
+                choices: [
+                  {
+                    index: 0,
+                    delta: { content: finalText },
+                    logprobs: null,
+                    finish_reason: null,
+                  },
+                ],
+              });
+            }
+
+            // Finish chunk
+            sseRaw(res, {
+              id: chatId,
+              object: "chat.completion.chunk",
+              created: Math.floor(Date.now() / 1000),
+              model: selected.route,
+              system_fingerprint: "fp_antigravity",
+              choices: [
+                {
+                  index: 0,
+                  delta: {},
+                  logprobs: null,
+                  finish_reason: "stop",
+                },
+              ],
+              usage: chatUsage(result),
+            });
+
+            if (!res.writableEnded) res.end("data: [DONE]\n\n");
+            return;
+          }
+
+          // Non-streaming chat completion
+          const result = await runAgyPrompt({
             config,
-            models,
+            selected,
             payload,
-            conversations,
-            responseStates,
+            prompt,
+            mode,
+            effort,
+            conversationId,
             signal: request.signal,
           });
-          json(res, 200, compacted.response);
+
+          if (result.conversation_id) conversations.set(chatId, result.conversation_id);
+          const responsePayload = {
+            id: chatId,
+            object: "chat.completion",
+            created: createdTime,
+            model: selected.route,
+            system_fingerprint: "fp_antigravity",
+            choices: [
+              {
+                index: 0,
+                message: {
+                  role: "assistant",
+                  content: result.response || "",
+                },
+                logprobs: null,
+                finish_reason: "stop",
+              },
+            ],
+            usage: chatUsage(result),
+          };
+          json(res, 200, responsePayload);
+          return;
         } finally {
           request.cleanup();
         }
-        return;
       }
-      const abort = new AbortController();
-      const cancel = () => {
-        if (!res.writableEnded && !abort.signal.aborted) abort.abort();
-      };
-      req.once("aborted", cancel);
-      res.once("close", cancel);
-      const stream = payload.stream === true;
-      if (isCompactionPayload(payload)) {
+
+      // POST /v1/completions (OpenAI Text Completions API)
+      if (req.method === "POST" && url.pathname === "/v1/completions") {
+        const payload = await readJson(req);
+        const selected = resolveModel(payload, models);
+
+        if (payload.prompt === undefined) {
+          throw new AgyError("prompt is required", "PROMPT_REQUIRED");
+        }
+
+        const prompt = buildAgyPrompt(payload);
+        const cmplId = `cmpl-${randomUUID().replaceAll("-", "")}`;
+        const createdTime = Math.floor(Date.now() / 1000);
+        const stream = payload.stream === true;
+        const effort = payload.reasoning_effort || payload.reasoning?.effort || payload.effort;
+        const mode = payload.mode || config.mode;
+        const request = requestAbortSignal(req, res);
+
+        try {
+          if (stream) {
+            res.writeHead(200, {
+              "content-type": "text/event-stream; charset=utf-8",
+              "cache-control": "no-cache, no-transform",
+              connection: "keep-alive",
+              "access-control-allow-origin": "*",
+            });
+
+            let sentDelta = false;
+            const result = await runAgyPrompt({
+              config,
+              selected,
+              payload,
+              prompt,
+              mode,
+              effort,
+              signal: request.signal,
+              onEvent: event => {
+                const delta = event.kind === "step" && typeof event.step.text_delta === "string"
+                  ? event.step.text_delta
+                  : "";
+                if (!delta) return;
+                sentDelta = true;
+                sseRaw(res, {
+                  id: cmplId,
+                  object: "text_completion",
+                  created: Math.floor(Date.now() / 1000),
+                  model: selected.route,
+                  choices: [
+                    {
+                      index: 0,
+                      text: delta,
+                      logprobs: null,
+                      finish_reason: null,
+                    },
+                  ],
+                });
+              },
+            });
+
+            const finalText = result.response || "";
+            if (!sentDelta && finalText) {
+              sseRaw(res, {
+                id: cmplId,
+                object: "text_completion",
+                created: Math.floor(Date.now() / 1000),
+                model: selected.route,
+                choices: [
+                  {
+                    index: 0,
+                    text: finalText,
+                    logprobs: null,
+                    finish_reason: null,
+                  },
+                ],
+              });
+            }
+
+            sseRaw(res, {
+              id: cmplId,
+              object: "text_completion",
+              created: Math.floor(Date.now() / 1000),
+              model: selected.route,
+              choices: [
+                {
+                  index: 0,
+                  text: "",
+                  logprobs: null,
+                  finish_reason: "stop",
+                },
+              ],
+              usage: chatUsage(result),
+            });
+
+            if (!res.writableEnded) res.end("data: [DONE]\n\n");
+            return;
+          }
+
+          const result = await runAgyPrompt({
+            config,
+            selected,
+            payload,
+            prompt,
+            mode,
+            effort,
+            signal: request.signal,
+          });
+
+          json(res, 200, {
+            id: cmplId,
+            object: "text_completion",
+            created: createdTime,
+            model: selected.route,
+            choices: [
+              {
+                index: 0,
+                text: result.response || "",
+                logprobs: null,
+                finish_reason: "stop",
+              },
+            ],
+            usage: chatUsage(result),
+          });
+          return;
+        } finally {
+          request.cleanup();
+        }
+      }
+
+      // POST /v1/responses and /v1/responses/compact (OpenAI Responses API)
+      if (req.method === "POST" && ["/v1/responses", "/v1/responses/compact"].includes(url.pathname)) {
+        const payload = await readJson(req);
+        const selected = resolveModel(payload, models);
+
+        if (url.pathname.endsWith("/compact")) {
+          const request = requestAbortSignal(req, res);
+          try {
+            const compacted = await runAgyCompaction({
+              config,
+              models,
+              payload,
+              conversations,
+              responseStates,
+              signal: request.signal,
+            });
+            json(res, 200, compacted.response);
+          } finally {
+            request.cleanup();
+          }
+          return;
+        }
+
+        const request = requestAbortSignal(req, res);
+        const stream = payload.stream === true;
+
+        if (isCompactionPayload(payload)) {
+          if (stream) {
+            res.writeHead(200, {
+              "content-type": "text/event-stream; charset=utf-8",
+              "cache-control": "no-cache, no-transform",
+              connection: "keep-alive",
+              "access-control-allow-origin": "*",
+            });
+            try {
+              const compacted = await runAgyCompaction({
+                config,
+                models,
+                payload,
+                conversations,
+                responseStates,
+                signal: request.signal,
+              });
+              emitCompactionEvents((event, data, sequence) => sse(res, event, sequence, data), compacted.response);
+              if (!res.writableEnded) res.end("data: [DONE]\n\n");
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              const failedSequence = { value: 0 };
+              const failed = responseBody({ id: `resp_${randomUUID().replaceAll("-", "")}`, model: selected.route, text: "", status: "failed" });
+              sse(res, "response.failed", failedSequence, { response: failed, error: { type: "server_error", message } });
+              if (!res.writableEnded) res.end("data: [DONE]\n\n");
+            } finally {
+              request.cleanup();
+            }
+            return;
+          }
+
+          try {
+            const compacted = await runAgyCompaction({
+              config,
+              models,
+              payload,
+              conversations,
+              responseStates,
+              signal: request.signal,
+            });
+            json(res, 200, compacted.response);
+          } finally {
+            request.cleanup();
+          }
+          return;
+        }
+
         if (stream) {
           res.writeHead(200, {
             "content-type": "text/event-stream; charset=utf-8",
@@ -884,15 +1090,15 @@ export function createBridgeServer(config, models) {
             "access-control-allow-origin": "*",
           });
           try {
-            const compacted = await runAgyCompaction({
+            await runAgyResponse({
               config,
               models,
               payload,
               conversations,
               responseStates,
-              signal: abort.signal,
+              signal: request.signal,
+              emit: (event, data, sequence) => sse(res, event, sequence, data),
             });
-            emitCompactionEvents((event, data, sequence) => sse(res, event, sequence, data), compacted.response);
             if (!res.writableEnded) res.end("data: [DONE]\n\n");
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
@@ -900,72 +1106,59 @@ export function createBridgeServer(config, models) {
             const failed = responseBody({ id: `resp_${randomUUID().replaceAll("-", "")}`, model: selected.route, text: "", status: "failed" });
             sse(res, "response.failed", failedSequence, { response: failed, error: { type: "server_error", message } });
             if (!res.writableEnded) res.end("data: [DONE]\n\n");
+          } finally {
+            request.cleanup();
           }
           return;
         }
-        const compacted = await runAgyCompaction({
-          config,
-          models,
-          payload,
-          conversations,
-          responseStates,
-          signal: abort.signal,
-        });
-        json(res, 200, compacted.response);
-        return;
-      }
-      if (stream) {
-        res.writeHead(200, {
-          "content-type": "text/event-stream; charset=utf-8",
-          "cache-control": "no-cache, no-transform",
-          connection: "keep-alive",
-          "access-control-allow-origin": "*",
-        });
+
         try {
-          await runAgyResponse({
+          const result = await runAgyResponse({
             config,
             models,
             payload,
             conversations,
             responseStates,
-            signal: abort.signal,
-            emit: (event, data, sequence) => sse(res, event, sequence, data),
+            signal: request.signal,
+            emit: () => {},
           });
-          if (!res.writableEnded) res.end("data: [DONE]\n\n");
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          const failedSequence = { value: 0 };
-          const failed = responseBody({ id: `resp_${randomUUID().replaceAll("-", "")}`, model: selected.route, text: "", status: "failed" });
-          sse(res, "response.failed", failedSequence, { response: failed, error: { type: "server_error", message } });
-          if (!res.writableEnded) res.end("data: [DONE]\n\n");
+          json(res, 200, result.response);
+        } finally {
+          request.cleanup();
         }
         return;
       }
 
-      const result = await runAgyResponse({
-        config,
-        models,
-        payload,
-        conversations,
-        responseStates,
-        signal: abort.signal,
-        emit: () => {},
-      });
-      json(res, 200, result.response);
+      // Not found
+      json(res, 404, errorPayload("Not found", "not_found"));
     } catch (error) {
       const status = error?.code === "MODEL_NOT_FOUND" ? 404
         : error?.code === "BODY_TOO_LARGE" ? 413
-          : error?.code === "UNSUPPORTED_ENCODING" || error?.code === "INVALID_ENCODING" ? 415
-          : error?.code === "ABORT_ERR" ? 499
-            : error?.code === "NATIVE_AUTH" ? 401
-              : error?.code === "NATIVE_UPSTREAM" || error?.code === "NATIVE_CATALOG"
-                || error?.code === "AGY_RESULT" || error?.code === "AGY_EXIT" || error?.code === "AGY_COMPACT" ? 502
-                : 400;
-      if (!res.headersSent) json(res, status, errorPayload(error instanceof Error ? error.message : String(error), error?.code === "AGY_PROCESS" ? "server_error" : "invalid_request_error", error?.code));
-      else if (!res.writableEnded) res.end();
+        : error?.code === "UNSUPPORTED_ENCODING" || error?.code === "INVALID_ENCODING" ? 415
+        : error?.code === "ABORT_ERR" ? 499
+        : error?.code === "AGY_RESULT" || error?.code === "AGY_EXIT" || error?.code === "AGY_COMPACT" ? 502
+        : 400;
+
+      if (!res.headersSent) {
+        json(
+          res,
+          status,
+          errorPayload(
+            error instanceof Error ? error.message : String(error),
+            error?.code === "AGY_PROCESS" ? "server_error" : "invalid_request_error",
+            error?.code
+          )
+        );
+      } else if (!res.writableEnded) {
+        res.end();
+      }
     }
   });
-  server.on("upgrade", (req, socket, head) => acceptWebSocket(config, models, conversations, responseStates, req, socket, head));
+
+  server.on("upgrade", (req, socket, head) => {
+    acceptWebSocket(config, models, conversations, responseStates, req, socket, head);
+  });
+
   return server;
 }
 
