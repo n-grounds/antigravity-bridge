@@ -179,3 +179,10 @@ npm test
 ## License
 
 MIT
+
+---
+
+## Acknowledgements
+
+Forked from Jakevin/codex-bridge-antigravity:main on 2026-11-13
+
